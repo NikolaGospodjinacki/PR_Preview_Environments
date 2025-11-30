@@ -1,0 +1,43 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+*.js
+*.js.map
+*.d.ts
+!vite.config.js
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Terraform
+infrastructure/terraform/.terraform/
+infrastructure/terraform/*.tfstate
+infrastructure/terraform/*.tfstate.*
+infrastructure/terraform/*.tfvars
+!infrastructure/terraform/*.tfvars.example
+infrastructure/terraform/.terraform.lock.hcl
+
+# Logs
+*.log
+npm-debug.log*
+
+# Kubernetes
+kubeconfig
+*.kubeconfig
+
+# Ngrok
+ngrok.yml

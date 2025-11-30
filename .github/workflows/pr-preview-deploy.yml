@@ -1,0 +1,200 @@
+name: Deploy PR Preview
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/preview-app
+
+jobs:
+  deploy-preview:
+    name: Deploy Preview Environment
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      pull-requests: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=pr-${{ github.event.pull_request.number }}
+            type=sha,prefix=pr-${{ github.event.pull_request.number }}-
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./app
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_BASE64 }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Deploy to Kubernetes
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GIT_SHA: ${{ github.sha }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:pr-${{ github.event.pull_request.number }}
+        run: |
+          NAMESPACE="pr-$PR_NUMBER"
+          
+          # Create namespace if it doesn't exist
+          kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+          kubectl label namespace "$NAMESPACE" pr-preview=true pr-number="$PR_NUMBER" --overwrite
+          
+          # Create temporary kustomization
+          cat > /tmp/kustomization.yaml << EOF
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+          
+          resources:
+            - https://github.com/${{ github.repository }}//k8s/base?ref=${{ github.sha }}
+          
+          namespace: $NAMESPACE
+          
+          patches:
+            - patch: |-
+                - op: replace
+                  path: /spec/template/spec/containers/0/env/1/value
+                  value: "$PR_NUMBER"
+              target:
+                kind: Deployment
+                name: preview-app
+            - patch: |-
+                - op: replace
+                  path: /spec/template/spec/containers/0/env/2/value
+                  value: "$GIT_SHA"
+              target:
+                kind: Deployment
+                name: preview-app
+            - patch: |-
+                - op: replace
+                  path: /spec/rules/0/http/paths/0/path
+                  value: "/pr-$PR_NUMBER"
+              target:
+                kind: Ingress
+                name: preview-app
+            - patch: |-
+                - op: replace
+                  path: /spec/rules/0/host
+                  value: ""
+              target:
+                kind: Ingress
+                name: preview-app
+          
+          images:
+            - name: preview-app
+              newName: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+              newTag: pr-$PR_NUMBER
+          EOF
+          
+          kubectl apply -k /tmp/
+          
+          # Wait for deployment
+          kubectl rollout status deployment/preview-app -n "$NAMESPACE" --timeout=120s
+
+      - name: Get preview URL
+        id: preview-url
+        run: |
+          # Get the ngrok URL or cluster URL from a ConfigMap if set
+          PREVIEW_BASE_URL="${{ secrets.PREVIEW_BASE_URL }}"
+          if [ -z "$PREVIEW_BASE_URL" ]; then
+            PREVIEW_BASE_URL="http://localhost"
+          fi
+          PREVIEW_URL="${PREVIEW_BASE_URL}/pr-${{ github.event.pull_request.number }}/"
+          echo "url=$PREVIEW_URL" >> $GITHUB_OUTPUT
+
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            const sha = context.sha.substring(0, 7);
+            const previewUrl = '${{ steps.preview-url.outputs.url }}';
+            
+            const body = `## 🚀 Preview Environment Deployed!
+            
+            | Property | Value |
+            |----------|-------|
+            | **Preview URL** | [${previewUrl}](${previewUrl}) |
+            | **Namespace** | \`pr-${prNumber}\` |
+            | **Git SHA** | \`${sha}\` |
+            | **Status** | ✅ Running |
+            
+            ---
+            
+            <details>
+            <summary>📋 Useful Commands</summary>
+            
+            \`\`\`bash
+            # View logs
+            kubectl logs -n pr-${prNumber} -l app=preview-app -f
+            
+            # Check status
+            kubectl get all -n pr-${prNumber}
+            
+            # Port forward locally
+            kubectl port-forward -n pr-${prNumber} svc/preview-app 8080:80
+            \`\`\`
+            
+            </details>
+            
+            > This preview will be automatically destroyed when the PR is closed.`;
+            
+            // Find existing comment
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber
+            });
+            
+            const botComment = comments.data.find(c => 
+              c.user.type === 'Bot' && c.body.includes('Preview Environment')
+            );
+            
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: body
+              });
+            }

@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: preview-app
+  labels:
+    app: preview-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: preview-app
+  template:
+    metadata:
+      labels:
+        app: preview-app
+    spec:
+      containers:
+        - name: preview-app
+          image: preview-app:latest
+          ports:
+            - containerPort: 3000
+          env:
+            - name: PORT
+              value: "3000"
+            - name: PR_NUMBER
+              value: "0"
+            - name: GIT_SHA
+              value: "unknown"
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 3
+            periodSeconds: 5
