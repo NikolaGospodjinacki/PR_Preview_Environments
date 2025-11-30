@@ -2,8 +2,12 @@
 set -e
 
 CLUSTER_NAME="pr-previews"
+HTTP_PORT="${HTTP_PORT:-8080}"
+HTTPS_PORT="${HTTPS_PORT:-8443}"
 
 echo "🚀 Creating k3d cluster: $CLUSTER_NAME"
+echo "   HTTP Port: $HTTP_PORT"
+echo "   HTTPS Port: $HTTPS_PORT"
 
 # Check if k3d is installed
 if ! command -v k3d &> /dev/null; then
@@ -25,11 +29,12 @@ if k3d cluster list | grep -q "$CLUSTER_NAME"; then
     fi
 fi
 
-# Create cluster with port mappings for ingress
+# Create cluster with port mappings for ingress (disable traefik to use nginx)
 k3d cluster create $CLUSTER_NAME \
-    --port "80:80@loadbalancer" \
-    --port "443:443@loadbalancer" \
+    --port "$HTTP_PORT:80@loadbalancer" \
+    --port "$HTTPS_PORT:443@loadbalancer" \
     --agents 2 \
+    --k3s-arg "--disable=traefik@server:0" \
     --wait
 
 echo "⏳ Waiting for cluster to be ready..."
@@ -50,7 +55,7 @@ echo ""
 echo "📋 Cluster Info:"
 echo "   Name: $CLUSTER_NAME"
 echo "   Nodes: $(kubectl get nodes --no-headers | wc -l)"
-echo "   Ingress: http://localhost"
+echo "   Ingress: http://localhost:$HTTP_PORT"
 echo ""
 echo "🔧 Next steps:"
 echo "   1. Run ./scripts/local/start-tunnel.sh to expose with ngrok"

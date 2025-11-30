@@ -39,65 +39,103 @@ if [ "$IMAGE" = "preview-app:latest" ]; then
     k3d image import preview-app:latest -c pr-previews
 fi
 
-# Create temporary kustomization overlay
-TEMP_DIR=$(mktemp -d)
-trap "rm -rf $TEMP_DIR" EXIT
+echo "📄 Applying Kubernetes manifests..."
 
-cat > "$TEMP_DIR/kustomization.yaml" << EOF
-apiVersion: kustomize.config.k8s.io/v1beta1
-kind: Kustomization
-
-resources:
-  - $PROJECT_ROOT/k8s/base
-
-namespace: $NAMESPACE
-
-patches:
-  - patch: |-
-      - op: replace
-        path: /spec/template/spec/containers/0/env/1/value
-        value: "$PR_NUMBER"
-    target:
-      kind: Deployment
-      name: preview-app
-  - patch: |-
-      - op: replace
-        path: /spec/template/spec/containers/0/env/2/value
-        value: "$GIT_SHA"
-    target:
-      kind: Deployment
-      name: preview-app
-  - patch: |-
-      - op: replace
-        path: /spec/rules/0/http/paths/0/path
-        value: "/pr-$PR_NUMBER"
-    target:
-      kind: Ingress
-      name: preview-app
-  - patch: |-
-      - op: add
-        path: /metadata/annotations/nginx.ingress.kubernetes.io~1rewrite-target
-        value: "/"
-    target:
-      kind: Ingress
-      name: preview-app
-  - patch: |-
-      - op: replace
-        path: /spec/rules/0/host
-        value: ""
-    target:
-      kind: Ingress
-      name: preview-app
-
-images:
-  - name: preview-app
-    newName: ${IMAGE%:*}
-    newTag: ${IMAGE#*:}
+# Apply Deployment
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: preview-app
+  namespace: $NAMESPACE
+  labels:
+    app: preview-app
+    pr-number: "$PR_NUMBER"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: preview-app
+  template:
+    metadata:
+      labels:
+        app: preview-app
+    spec:
+      containers:
+        - name: preview-app
+          image: $IMAGE
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 3000
+          env:
+            - name: PORT
+              value: "3000"
+            - name: PR_NUMBER
+              value: "$PR_NUMBER"
+            - name: GIT_SHA
+              value: "$GIT_SHA"
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 3
+            periodSeconds: 5
 EOF
 
-# Apply manifests
-echo "📄 Applying Kubernetes manifests..."
-kubectl apply -k "$TEMP_DIR"
+# Apply Service
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Service
+metadata:
+  name: preview-app
+  namespace: $NAMESPACE
+  labels:
+    app: preview-app
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: 3000
+      protocol: TCP
+  selector:
+    app: preview-app
+EOF
+
+# Apply Ingress
+cat <<EOF | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: preview-app
+  namespace: $NAMESPACE
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /\$2
+spec:
+  ingressClassName: nginx
+  rules:
+    - http:
+        paths:
+          - path: /pr-$PR_NUMBER(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: preview-app
+                port:
+                  number: 80
+EOF
 
 # Wait for deployment
 echo "⏳ Waiting for deployment to be ready..."
@@ -114,7 +152,7 @@ echo "   PR Number: $PR_NUMBER"
 echo "   Git SHA: $GIT_SHA"
 echo ""
 echo "🔗 Access URLs:"
-echo "   Local: http://localhost/pr-$PR_NUMBER/"
+echo "   Local: http://localhost:8080/pr-$PR_NUMBER/"
 echo "   Ngrok: https://<your-ngrok-url>/pr-$PR_NUMBER/"
 echo ""
 echo "📊 Check status:"
