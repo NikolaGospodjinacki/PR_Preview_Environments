@@ -1,207 +1,296 @@
-# 🏠 Local Development Setup
+#  Local Development Setup Guide
 
-This guide explains how to run PR Preview Environments locally using k3d and ngrok.
+This guide walks you through setting up PR Preview Environments locally using **k3d** (Kubernetes in Docker) and **ngrok** for public access.
 
-## Prerequisites
+**Cost: $0** - Everything runs on your machine!
 
-### 1. Install Docker Desktop
+---
 
-Download and install from: https://www.docker.com/products/docker-desktop
+##  Prerequisites
 
-### 2. Install k3d
+### Required Tools
 
+| Tool | Version | Purpose | Installation |
+|------|---------|---------|--------------|
+| Docker | 20+ | Container runtime | [docker.com](https://docker.com) |
+| kubectl | 1.28+ | Kubernetes CLI | [kubernetes.io](https://kubernetes.io/docs/tasks/tools/) |
+| k3d | 5.x | Local K8s clusters | See below |
+| ngrok | 3.x | Public tunnels | [ngrok.com](https://ngrok.com/download) |
+
+### Install k3d
+
+**Linux/macOS:**
 ```bash
-# Linux/macOS
 curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
-
-# Windows (PowerShell)
-choco install k3d
-# or
-winget install k3d
 ```
 
-### 3. Install kubectl
-
+**Windows (WSL2 recommended):**
 ```bash
-# Linux
-curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
-
-# macOS
-brew install kubectl
-
-# Windows
-choco install kubernetes-cli
+# In WSL2 terminal
+curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
 ```
 
-### 4. Install ngrok
-
-1. Sign up at https://ngrok.com (free tier is fine)
-2. Download ngrok: https://ngrok.com/download
-3. Get your auth token from: https://dashboard.ngrok.com/get-started/your-authtoken
+### Verify Prerequisites
 
 ```bash
-# Add to your shell profile
-export NGROK_AUTH_TOKEN=your_token_here
-
-# Or configure directly
-ngrok authtoken your_token_here
+docker --version     # Docker version 20+
+kubectl version      # Client Version: v1.28+
+k3d version         # k3d version v5.x
 ```
 
 ---
 
-## Quick Start
-
-### 1. Create the k3d Cluster
+##  Step 1: Create the Cluster
 
 ```bash
+# From the project root
 ./scripts/local/create-cluster.sh
 ```
 
-This will:
-- Create a k3d cluster named `pr-previews`
-- Map ports 80 and 443 to your localhost
-- Install Nginx Ingress Controller
+This script:
+1. Creates a 3-node k3s cluster named `pr-previews`
+2. Maps ports 8080 (HTTP) and 8443 (HTTPS) to your localhost
+3. Disables Traefik (we use Nginx Ingress instead)
+4. Installs the Nginx Ingress Controller
 
-### 2. Deploy a Test Preview
+### What Gets Created
 
-```bash
-# Deploy a preview for "PR #1"
-./scripts/deploy-preview.sh 1
-
-# Check it's running
-kubectl get all -n pr-1
-
-# Access locally
-curl http://localhost/pr-1/
 ```
 
-### 3. Start ngrok Tunnel (Optional)
+                     Docker Desktop                           
+                                                              
+  ─ 
+                    k3d-pr-previews                         
+                                                            
+             
+       Server         Agent-0        Agent-1        
+       (Control)      (Worker)       (Worker)       
+             
+                                                            
+       
+                  Nginx Ingress Controller              
+                       Port 80  8080                   
+                       Port 443  8443                  
+       
+   
+─
+            Port 8080               Port 8443
+       http://localhost:8080    https://localhost:8443
+```
 
-To make your previews accessible from the internet:
+### Verify Cluster
+
+```bash
+# Check nodes
+kubectl get nodes
+# Expected: 3 nodes (1 server, 2 agents)
+
+# Check ingress controller
+kubectl get pods -n ingress-nginx
+# Expected: controller pod in Running state
+
+# Check ingress class
+kubectl get ingressclass
+# Expected: nginx class
+```
+
+---
+
+##  Step 2: Deploy a Preview
+
+```bash
+# Deploy preview for PR #1
+./scripts/deploy-preview.sh 1
+```
+
+This script:
+1. Creates namespace `pr-1`
+2. Builds the Docker image locally
+3. Imports the image into k3d
+4. Deploys Deployment, Service, and Ingress
+
+### Test the Preview
+
+```bash
+# Main page
+curl http://localhost:8080/pr-1/
+
+# Health check
+curl http://localhost:8080/pr-1/health
+# {"status":"healthy","timestamp":"..."}
+
+# API info
+curl http://localhost:8080/pr-1/api/info
+# {"pr":"1","sha":"local","deployedAt":"...","environment":"preview"}
+```
+
+### Deploy Multiple Previews
+
+```bash
+# Deploy PR #2
+./scripts/deploy-preview.sh 2
+
+# Deploy PR #42
+./scripts/deploy-preview.sh 42
+
+# Each gets its own namespace and URL path
+# http://localhost:8080/pr-2/
+# http://localhost:8080/pr-42/
+```
+
+### List Active Previews
+
+```bash
+./scripts/list-previews.sh
+```
+
+---
+
+##  Step 3: Expose Publicly with ngrok
+
+### One-time Setup
+
+1. Create a free account at [ngrok.com](https://ngrok.com)
+2. Get your auth token from [dashboard.ngrok.com](https://dashboard.ngrok.com/get-started/your-authtoken)
+3. Configure ngrok:
+
+```bash
+ngrok config add-authtoken YOUR_AUTH_TOKEN
+```
+
+### Start the Tunnel
 
 ```bash
 ./scripts/local/start-tunnel.sh
 ```
 
-This will output a URL like `https://abc123.ngrok.io`. Your previews will be at:
-- `https://abc123.ngrok.io/pr-1/`
-- `https://abc123.ngrok.io/pr-2/`
-- etc.
+Or manually:
+```bash
+ngrok http 8080 --host-header=localhost
+```
 
-### 4. Clean Up
+### Access Your Preview
+
+ngrok provides a public URL like:
+```
+https://abc123-your-name.ngrok-free.dev
+```
+
+Your preview is now accessible at:
+```
+https://abc123-your-name.ngrok-free.dev/pr-1/
+```
+
+> **Note**: Free ngrok URLs change each time you restart. Paid plans get static URLs.
+
+---
+
+##  Step 4: Cleanup
+
+### Destroy a Single Preview
 
 ```bash
-# Delete a specific preview
 ./scripts/destroy-preview.sh 1
-
-# List all previews
-./scripts/list-previews.sh
-
-# Destroy the entire cluster
-./scripts/local/destroy-cluster.sh
+# Deletes namespace pr-1 and all resources in it
 ```
 
----
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        Your Machine                                  │
-│  ┌───────────────────────────────────────────────────────────────┐  │
-│  │                    k3d Cluster                                 │  │
-│  │  ┌─────────────────────────────────────────────────────────┐  │  │
-│  │  │              Nginx Ingress Controller                    │  │  │
-│  │  │                  localhost:80                            │  │  │
-│  │  └─────────────────────────────────────────────────────────┘  │  │
-│  │                           │                                    │  │
-│  │       ┌───────────────────┼───────────────────┐               │  │
-│  │       ▼                   ▼                   ▼               │  │
-│  │  ┌─────────┐        ┌─────────┐        ┌─────────┐           │  │
-│  │  │ pr-1    │        │ pr-2    │        │ pr-3    │           │  │
-│  │  │ /pr-1/  │        │ /pr-2/  │        │ /pr-3/  │           │  │
-│  │  └─────────┘        └─────────┘        └─────────┘           │  │
-│  └───────────────────────────────────────────────────────────────┘  │
-│                               │                                      │
-│                               ▼                                      │
-│  ┌───────────────────────────────────────────────────────────────┐  │
-│  │                     ngrok Tunnel                               │  │
-│  │              https://xxxxx.ngrok.io                           │  │
-│  └───────────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Connecting GitHub Actions to Local Cluster
-
-For testing the full workflow with GitHub Actions, you need to expose your kubeconfig:
-
-### Option 1: Use ngrok TCP Tunnel (Complex)
-
-Not recommended for local development.
-
-### Option 2: Use a Self-Hosted Runner
-
-1. Install a GitHub Actions runner on your machine
-2. Configure it to use your local kubeconfig
-3. Update workflows to use `runs-on: self-hosted`
-
-### Option 3: Test Locally, Deploy to EKS (Recommended)
-
-- Develop and test locally with k3d
-- Use EKS for actual PR previews from GitHub Actions
-- See [EKS Setup Guide](EKS_SETUP.md)
-
----
-
-## Troubleshooting
-
-### Cluster won't start
+### Destroy the Entire Cluster
 
 ```bash
-# Check Docker is running
+./scripts/local/destroy-cluster.sh
+# Removes the k3d cluster completely
+```
+
+---
+
+##  Troubleshooting
+
+### Port 80/443 Already in Use
+
+The scripts use ports 8080/8443 by default. If these are also in use:
+
+```bash
+HTTP_PORT=9080 HTTPS_PORT=9443 ./scripts/local/create-cluster.sh
+```
+
+### Docker Not Running
+
+```bash
+# Check Docker status
 docker info
 
-# Check for port conflicts
-netstat -an | grep ":80 "
-
-# Delete and recreate
-k3d cluster delete pr-previews
-./scripts/local/create-cluster.sh
+# If not running, start Docker Desktop
 ```
 
-### Can't access localhost
+### Image Not Found in k3d
+
+If pods show `ImagePullBackOff`:
 
 ```bash
-# Check ingress controller is running
-kubectl get pods -n ingress-nginx
+# Re-import the image
+k3d image import preview-app:latest -c pr-previews
+```
 
-# Check ingress rules
+### Ingress Not Routing
+
+Check ingress controller logs:
+```bash
+kubectl logs -n ingress-nginx -l app.kubernetes.io/component=controller
+```
+
+Verify ingress rules:
+```bash
 kubectl get ingress -A
-
-# Check service
-kubectl get svc -n ingress-nginx
+kubectl describe ingress preview-app -n pr-1
 ```
 
-### ngrok not working
+### WSL2-Specific Issues
 
-```bash
-# Verify auth token
-ngrok authtoken your_token
+If using Windows with WSL2:
 
-# Check ngrok status
-curl http://127.0.0.1:4040/api/tunnels
-```
+1. **Ensure Docker Desktop WSL2 integration is enabled**
+   - Docker Desktop  Settings  Resources  WSL Integration
+
+2. **Run scripts from WSL2 terminal**, not PowerShell
+
+3. **Access via localhost** works in most cases, but you can also use:
+   ```bash
+   curl http://$(hostname).local:8080/pr-1/
+   ```
 
 ---
 
-## Cost
+##  Resource Usage
 
-| Resource | Cost |
-|----------|------|
-| k3d | Free |
-| Docker | Free |
-| ngrok (free tier) | Free |
-| **Total** | **$0/month** |
+Local development is lightweight:
+
+| Resource | Usage |
+|----------|-------|
+| CPU | ~0.5 core idle, ~2 cores during builds |
+| Memory | ~1.5 GB for cluster + ~100MB per preview |
+| Disk | ~2 GB for images and cluster data |
+
+---
+
+##  What You're Learning
+
+By running this locally, you gain hands-on experience with:
+
+- **k3d/k3s**: Lightweight Kubernetes distributions
+- **kubectl**: Kubernetes CLI operations
+- **Namespaces**: Isolating workloads
+- **Ingress**: HTTP routing with path-based rules
+- **Docker**: Building and managing images
+- **ngrok**: Exposing local services publicly
+
+---
+
+##  Next Steps
+
+Once comfortable with local development:
+
+1. **Customize the app** - Edit `app/src/index.ts` and redeploy
+2. **Add your own app** - Replace the sample with your real application
+3. **Try EKS** - Deploy to AWS for a production-grade setup
+
+ **[EKS Setup Guide ](EKS_SETUP.md)**

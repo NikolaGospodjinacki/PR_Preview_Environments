@@ -5,135 +5,168 @@ on:
     types: [opened, synchronize, reopened]
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}/preview-app
+  AWS_REGION: us-east-1
+  CLUSTER_NAME: pr-previews-eks
 
 jobs:
   deploy-preview:
     name: Deploy Preview Environment
     runs-on: ubuntu-latest
     permissions:
+      id-token: write
       contents: read
-      packages: write
       pull-requests: write
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=pr-${{ github.event.pull_request.number }}
-            type=sha,prefix=pr-${{ github.event.pull_request.number }}-
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: ./app
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Set up kubectl
-        uses: azure/setup-kubectl@v3
-        with:
-          version: 'v1.28.0'
-
-      - name: Configure kubeconfig
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: pr-previews/preview-app
+          IMAGE_TAG: pr-${{ github.event.pull_request.number }}-${{ github.sha }}
         run: |
-          mkdir -p ~/.kube
-          echo "${{ secrets.KUBECONFIG_BASE64 }}" | base64 -d > ~/.kube/config
-          chmod 600 ~/.kube/config
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG ./app
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
 
-      - name: Deploy to Kubernetes
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.CLUSTER_NAME }}
+
+      - name: Deploy to EKS
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           GIT_SHA: ${{ github.sha }}
-          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:pr-${{ github.event.pull_request.number }}
+          IMAGE: ${{ steps.build-image.outputs.image }}
         run: |
           NAMESPACE="pr-$PR_NUMBER"
-          
+
           # Create namespace if it doesn't exist
           kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
           kubectl label namespace "$NAMESPACE" pr-preview=true pr-number="$PR_NUMBER" --overwrite
-          
-          # Create temporary kustomization
-          cat > /tmp/kustomization.yaml << EOF
-          apiVersion: kustomize.config.k8s.io/v1beta1
-          kind: Kustomization
-          
-          resources:
-            - https://github.com/${{ github.repository }}//k8s/base?ref=${{ github.sha }}
-          
-          namespace: $NAMESPACE
-          
-          patches:
-            - patch: |-
-                - op: replace
-                  path: /spec/template/spec/containers/0/env/1/value
-                  value: "$PR_NUMBER"
-              target:
-                kind: Deployment
-                name: preview-app
-            - patch: |-
-                - op: replace
-                  path: /spec/template/spec/containers/0/env/2/value
-                  value: "$GIT_SHA"
-              target:
-                kind: Deployment
-                name: preview-app
-            - patch: |-
-                - op: replace
-                  path: /spec/rules/0/http/paths/0/path
-                  value: "/pr-$PR_NUMBER"
-              target:
-                kind: Ingress
-                name: preview-app
-            - patch: |-
-                - op: replace
-                  path: /spec/rules/0/host
-                  value: ""
-              target:
-                kind: Ingress
-                name: preview-app
-          
-          images:
-            - name: preview-app
-              newName: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-              newTag: pr-$PR_NUMBER
-          EOF
-          
-          kubectl apply -k /tmp/
-          
-          # Wait for deployment
-          kubectl rollout status deployment/preview-app -n "$NAMESPACE" --timeout=120s
 
-      - name: Get preview URL
-        id: preview-url
+          # Apply Deployment
+          cat <<EOF | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: preview-app
+            namespace: $NAMESPACE
+            labels:
+              app: preview-app
+              pr-number: "$PR_NUMBER"
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: preview-app
+            template:
+              metadata:
+                labels:
+                  app: preview-app
+              spec:
+                containers:
+                  - name: preview-app
+                    image: $IMAGE
+                    ports:
+                      - containerPort: 3000
+                    env:
+                      - name: PORT
+                        value: "3000"
+                      - name: PR_NUMBER
+                        value: "$PR_NUMBER"
+                      - name: GIT_SHA
+                        value: "$GIT_SHA"
+                    resources:
+                      requests:
+                        memory: "64Mi"
+                        cpu: "50m"
+                      limits:
+                        memory: "128Mi"
+                        cpu: "100m"
+                    livenessProbe:
+                      httpGet:
+                        path: /health
+                        port: 3000
+                      initialDelaySeconds: 5
+                      periodSeconds: 10
+                    readinessProbe:
+                      httpGet:
+                        path: /health
+                        port: 3000
+                      initialDelaySeconds: 3
+                      periodSeconds: 5
+          EOF
+
+          # Apply Service
+          cat <<EOF | kubectl apply -f -
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: preview-app
+            namespace: $NAMESPACE
+            labels:
+              app: preview-app
+          spec:
+            type: ClusterIP
+            ports:
+              - port: 80
+                targetPort: 3000
+                protocol: TCP
+            selector:
+              app: preview-app
+          EOF
+
+          # Apply Ingress
+          cat <<EOF | kubectl apply -f -
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: preview-app
+            namespace: $NAMESPACE
+            annotations:
+              nginx.ingress.kubernetes.io/rewrite-target: /\$2
+          spec:
+            ingressClassName: nginx
+            rules:
+              - http:
+                  paths:
+                    - path: /pr-$PR_NUMBER(/|$)(.*)
+                      pathType: ImplementationSpecific
+                      backend:
+                        service:
+                          name: preview-app
+                          port:
+                            number: 80
+          EOF
+
+          # Wait for deployment
+          kubectl wait --namespace "$NAMESPACE" \
+              --for=condition=available deployment/preview-app \
+              --timeout=120s
+
+      - name: Get Ingress URL
+        id: get-url
         run: |
-          # Get the ngrok URL or cluster URL from a ConfigMap if set
-          PREVIEW_BASE_URL="${{ secrets.PREVIEW_BASE_URL }}"
-          if [ -z "$PREVIEW_BASE_URL" ]; then
-            PREVIEW_BASE_URL="http://localhost"
+          # Get the LoadBalancer hostname/IP
+          INGRESS_HOST=$(kubectl get svc -n ingress-nginx ingress-nginx-controller -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          if [ -z "$INGRESS_HOST" ]; then
+            INGRESS_HOST=$(kubectl get svc -n ingress-nginx ingress-nginx-controller -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
           fi
-          PREVIEW_URL="${PREVIEW_BASE_URL}/pr-${{ github.event.pull_request.number }}/"
-          echo "url=$PREVIEW_URL" >> $GITHUB_OUTPUT
+          echo "preview_url=http://$INGRESS_HOST/pr-${{ github.event.pull_request.number }}/" >> $GITHUB_OUTPUT
 
       - name: Comment on PR
         uses: actions/github-script@v7
@@ -141,48 +174,36 @@ jobs:
           script: |
             const prNumber = context.payload.pull_request.number;
             const sha = context.sha.substring(0, 7);
-            const previewUrl = '${{ steps.preview-url.outputs.url }}';
-            
-            const body = `## 🚀 Preview Environment Deployed!
-            
+            const previewUrl = '${{ steps.get-url.outputs.preview_url }}';
+
+            const body = `##  Preview Environment Deployed!
+
+            Your changes have been deployed to a preview environment.
+
             | Property | Value |
             |----------|-------|
-            | **Preview URL** | [${previewUrl}](${previewUrl}) |
+            | **Preview URL** | ${previewUrl} |
             | **Namespace** | \`pr-${prNumber}\` |
-            | **Git SHA** | \`${sha}\` |
-            | **Status** | ✅ Running |
-            
-            ---
-            
-            <details>
-            <summary>📋 Useful Commands</summary>
-            
-            \`\`\`bash
-            # View logs
-            kubectl logs -n pr-${prNumber} -l app=preview-app -f
-            
-            # Check status
-            kubectl get all -n pr-${prNumber}
-            
-            # Port forward locally
-            kubectl port-forward -n pr-${prNumber} svc/preview-app 8080:80
-            \`\`\`
-            
-            </details>
-            
-            > This preview will be automatically destroyed when the PR is closed.`;
-            
+            | **Commit** | \`${sha}\` |
+
+            ### Quick Links
+            -  [Open Preview](${previewUrl})
+            -  [Health Check](${previewUrl}health)
+            -  [API Info](${previewUrl}api/info)
+
+            >  Preview will be destroyed when this PR is closed or merged.`;
+
             // Find existing comment
             const comments = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: prNumber
             });
-            
-            const botComment = comments.data.find(c => 
+
+            const botComment = comments.data.find(c =>
               c.user.type === 'Bot' && c.body.includes('Preview Environment')
             );
-            
+
             if (botComment) {
               await github.rest.issues.updateComment({
                 owner: context.repo.owner,

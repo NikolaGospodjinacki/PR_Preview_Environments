@@ -24,6 +24,11 @@ output "vpc_id" {
   value       = aws_vpc.main.id
 }
 
+output "ecr_repository_url" {
+  description = "ECR repository URL"
+  value       = aws_ecr_repository.preview_app.repository_url
+}
+
 output "kubeconfig_command" {
   description = "Command to update kubeconfig"
   value       = "aws eks update-kubeconfig --region ${var.aws_region} --name ${aws_eks_cluster.main.name}"

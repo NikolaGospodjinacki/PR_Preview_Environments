@@ -1,252 +1,377 @@
-# ☁️ EKS Production Setup
+#  AWS EKS Production Setup Guide
 
-This guide explains how to deploy PR Preview Environments to AWS EKS for production use.
+This guide walks you through deploying PR Preview Environments to **AWS EKS** (Elastic Kubernetes Service) with automated GitHub Actions CI/CD.
 
-## Prerequisites
+**Cost: ~$0.30/hour** - Only pay for what you use!
 
-### 1. AWS CLI
+---
+
+##  Prerequisites
+
+### Required Tools
+
+| Tool | Version | Purpose | Installation |
+|------|---------|---------|--------------|
+| AWS CLI | 2.x | AWS management | [aws.amazon.com](https://aws.amazon.com/cli/) |
+| Terraform | 1.0+ | Infrastructure as Code | [terraform.io](https://terraform.io) |
+| kubectl | 1.28+ | Kubernetes CLI | [kubernetes.io](https://kubernetes.io/docs/tasks/tools/) |
+
+### AWS Requirements
+
+- AWS Account with admin access (or appropriate IAM permissions)
+- AWS CLI configured with credentials:
+  ```bash
+  aws configure
+  # Enter your Access Key ID, Secret Access Key, and region
+  ```
+
+### Verify Prerequisites
 
 ```bash
-# Install
-curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-unzip awscliv2.zip
-sudo ./aws/install
-
-# Configure
-aws configure
-```
-
-### 2. Terraform
-
-```bash
-# Linux/macOS
-brew install terraform
-
-# Or download from https://www.terraform.io/downloads
-```
-
-### 3. kubectl
-
-```bash
-brew install kubectl
+aws --version           # aws-cli/2.x
+terraform --version     # Terraform v1.x
+kubectl version         # Client Version: v1.28+
+aws sts get-caller-identity  # Verify AWS auth
 ```
 
 ---
 
-## Quick Start
+##  Architecture Overview
 
-### 1. Configure Terraform Variables
+```
+
+                                  AWS                                         
+                                                                              
+      
+                            VPC (10.0.0.0/16)                              
+                                                                            
+     Public Subnets (10.0.1.0/24, 10.0.2.0/24)                             
+     ─                        
+      NAT Gateway    NAT Gateway        ALB                         
+                             
+                                                                        
+     Private Subnets (10.0.10.0/24, 10.0.11.0/24)                         
+              
+                         EKS Cluster                                     
+                                        
+         t3.medium       t3.medium      Node Group                 
+          (Node 1)        (Node 2)                                  
+                                        
+                                                                         
+                 
+                     Nginx Ingress Controller                         
+       ─          
+                                                                        
+           ─                  
+                                                                     
+                                         
+        pr-101            pr-102            pr-103               
+                 ─                        
+     ─         
+      │
+                                                                              
+                                                      
+          ECR            Container Registry                               
+   (preview-app images)                                                    
+                                                      
+
+                                    
+                    
+                           GitHub Actions          
+                       (OIDC Authentication)       
+                    
+```
+
+---
+
+##  Step 1: Deploy Infrastructure with Terraform
+
+### Configure Variables
 
 ```bash
 cd infrastructure/terraform
+
+# Copy example variables
 cp terraform.tfvars.example terraform.tfvars
 ```
 
 Edit `terraform.tfvars`:
 ```hcl
-aws_region   = "us-east-1"
-project_name = "pr-previews"
-environment  = "dev"
-github_repo  = "YOUR_USERNAME/PR_Preview_Environments"
+aws_region     = "us-east-1"
+project_name   = "pr-previews"
+github_repo    = "YOUR_USERNAME/PR_Preview_Environments"
+environment    = "dev"
+
+# Optional customization
+cluster_version    = "1.28"
+node_instance_type = "t3.medium"
+node_desired_size  = 2
+node_min_size      = 1
+node_max_size      = 4
 ```
 
-### 2. Create the EKS Cluster
+### Deploy Infrastructure
 
 ```bash
-./scripts/eks/create-cluster.sh
+# Initialize Terraform
+terraform init
+
+# Preview changes
+terraform plan
+
+# Apply (takes ~15 minutes)
+terraform apply
 ```
 
-This will:
-- Create a VPC with public and private subnets
-- Create an EKS cluster with 2 worker nodes
-- Install Nginx Ingress Controller with AWS Load Balancer
-- Set up GitHub OIDC for Actions authentication
-
-**⏱️ Time: ~15-20 minutes**
-
-### 3. Configure GitHub Secrets
-
-After the cluster is created, set these GitHub secrets:
-
-| Secret | Value |
-|--------|-------|
-| `AWS_ROLE_ARN` | From terraform output: `terraform output github_actions_role_arn` |
-| `KUBECONFIG_BASE64` | `cat ~/.kube/config \| base64 -w 0` |
-| `PREVIEW_BASE_URL` | Load Balancer URL from the script output |
-
-### 4. Test It
-
-1. Create a new branch
-2. Make a change to `app/src/index.ts`
-3. Open a Pull Request
-4. Watch the GitHub Action deploy a preview
-5. Check the PR comment for the preview URL
-
-### 5. Destroy When Done
+### Get Outputs
 
 ```bash
-./scripts/eks/destroy-cluster.sh
+# Get the role ARN for GitHub Actions
+terraform output github_actions_role_arn
+
+# Get the ECR repository URL
+terraform output ecr_repository_url
+
+# Configure kubectl
+$(terraform output -raw kubeconfig_command)
 ```
 
 ---
 
-## Architecture
+##  Step 2: Install Nginx Ingress Controller
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              AWS Account                                     │
-│                                                                              │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │                              VPC                                     │    │
-│  │  ┌─────────────────────────────────────────────────────────────┐    │    │
-│  │  │                    Public Subnets                            │    │    │
-│  │  │  ┌─────────────────────────────────────────────────────┐    │    │    │
-│  │  │  │           Application Load Balancer                  │    │    │    │
-│  │  │  │         (Nginx Ingress Controller)                   │    │    │    │
-│  │  │  └─────────────────────────────────────────────────────┘    │    │    │
-│  │  └─────────────────────────────────────────────────────────────┘    │    │
-│  │                               │                                      │    │
-│  │  ┌─────────────────────────────────────────────────────────────┐    │    │
-│  │  │                   Private Subnets                            │    │    │
-│  │  │  ┌─────────────────────────────────────────────────────┐    │    │    │
-│  │  │  │                 EKS Cluster                          │    │    │    │
-│  │  │  │  ┌───────────────┐    ┌───────────────┐             │    │    │    │
-│  │  │  │  │  Node Group   │    │  Node Group   │             │    │    │    │
-│  │  │  │  │  (t3.medium)  │    │  (t3.medium)  │             │    │    │    │
-│  │  │  │  └───────────────┘    └───────────────┘             │    │    │    │
-│  │  │  │         │                    │                       │    │    │    │
-│  │  │  │    ┌────┴────────────────────┴────┐                 │    │    │    │
-│  │  │  │    │      Preview Namespaces       │                 │    │    │    │
-│  │  │  │    │  pr-1  │  pr-2  │  pr-3  │   │                 │    │    │    │
-│  │  │  │    └───────────────────────────────┘                 │    │    │    │
-│  │  │  └─────────────────────────────────────────────────────┘    │    │    │
-│  │  └─────────────────────────────────────────────────────────────┘    │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Cost Breakdown
-
-| Resource | Hourly | Monthly (24/7) | Notes |
-|----------|--------|----------------|-------|
-| EKS Control Plane | $0.10 | $72 | Fixed cost |
-| t3.medium nodes (2x) | $0.042 each | $60 | On-demand pricing |
-| NAT Gateways (2x) | $0.045 each | $65 | For private subnets |
-| Load Balancer | $0.025 | $18 | Plus data transfer |
-| **Total** | **~$0.30/hr** | **~$215/month** | |
-
-### Cost Optimization Tips
-
-1. **Use Spot Instances**: Add `capacity_type = "SPOT"` to node group for ~60% savings
-2. **Single NAT Gateway**: Use 1 NAT instead of 2 for ~$32/month savings
-3. **Destroy when not using**: Run cluster only during work hours
-4. **Right-size nodes**: Use t3.small if previews are light
-
-### On-Demand Usage
-
-If you only run the cluster for demos:
-
-| Usage | Cost |
-|-------|------|
-| 2 hours | ~$0.60 |
-| 8 hours | ~$2.40 |
-| 1 week | ~$50 |
-
----
-
-## GitHub Actions Integration
-
-The workflows are already configured to:
-
-1. **On PR Open/Update** (`pr-preview-deploy.yml`):
-   - Build Docker image
-   - Push to GitHub Container Registry
-   - Deploy to EKS in a new namespace
-   - Comment on PR with preview URL
-
-2. **On PR Close** (`pr-preview-cleanup.yml`):
-   - Delete the preview namespace
-   - Update PR comment
-
-### Required Secrets
-
-| Secret | Description | How to Get |
-|--------|-------------|------------|
-| `AWS_ROLE_ARN` | IAM role for OIDC auth | `terraform output github_actions_role_arn` |
-| `KUBECONFIG_BASE64` | Base64 kubeconfig | `cat ~/.kube/config \| base64 -w 0` |
-| `PREVIEW_BASE_URL` | Load Balancer URL | From create script output |
-
----
-
-## Maintenance
-
-### Updating Kubernetes Version
-
-1. Update `cluster_version` in `terraform.tfvars`
-2. Run `terraform plan` to see changes
-3. Run `terraform apply` (rolling update)
-
-### Scaling Nodes
+After the EKS cluster is created, install the ingress controller:
 
 ```bash
-# Edit terraform.tfvars
-node_desired_size = 3
-node_max_size     = 6
+# Verify kubectl is connected
+kubectl get nodes
 
-# Apply
+# Install Nginx Ingress Controller
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.9.4/deploy/static/provider/aws/deploy.yaml
+
+# Wait for it to be ready
+kubectl wait --namespace ingress-nginx \
+    --for=condition=ready pod \
+    --selector=app.kubernetes.io/component=controller \
+    --timeout=120s
+
+# Get the Load Balancer URL
+kubectl get svc -n ingress-nginx ingress-nginx-controller
+```
+
+---
+
+##  Step 3: Configure GitHub
+
+### Add Repository Secrets
+
+Go to your repository: **Settings  Secrets and variables  Actions**
+
+| Secret | Value | How to Get |
+|--------|-------|------------|
+| `AWS_ROLE_ARN` | `arn:aws:iam::123456789:role/pr-previews-github-actions-role` | `terraform output github_actions_role_arn` |
+
+### Verify OIDC Connection
+
+The Terraform creates a GitHub OIDC provider. This allows GitHub Actions to authenticate with AWS without storing long-lived credentials.
+
+---
+
+##  Step 4: Test the Pipeline
+
+### Create a Test PR
+
+```bash
+# Create a feature branch
+git checkout -b test/preview-demo
+
+# Make a change
+echo "# Test" >> README.md
+
+# Commit and push
+git add .
+git commit -m "test: trigger preview deployment"
+git push -u origin test/preview-demo
+
+# Create a PR via GitHub UI or CLI
+gh pr create --title "Test Preview" --body "Testing preview deployment"
+```
+
+### Watch the Workflow
+
+1. Go to **Actions** tab in your repository
+2. Watch the "Deploy PR Preview" workflow
+3. Once complete, check the PR for the preview URL comment
+
+### Verify the Preview
+
+```bash
+# Get the Load Balancer URL
+LB_URL=$(kubectl get svc -n ingress-nginx ingress-nginx-controller -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+# Test the preview
+curl http://$LB_URL/pr-1/
+curl http://$LB_URL/pr-1/health
+```
+
+---
+
+##  Cost Management
+
+### Current Resources
+
+| Resource | Cost/Hour | Cost/Month (24/7) |
+|----------|-----------|-------------------|
+| EKS Control Plane | $0.10 | $73 |
+| t3.medium  2 | $0.084 | $61 |
+| NAT Gateway  2 | $0.09 | $65 |
+| Load Balancer | $0.025 | $18 |
+| ECR (1GB) | - | $0.10 |
+| **Total** | **~$0.30** | **~$218** |
+
+### Cost Optimization Strategies
+
+1. **On-Demand Usage**: Destroy when not demoing
+   ```bash
+   terraform destroy  # Stops all billing
+   ```
+
+2. **Reduce NAT Gateways**: Use 1 instead of 2
+   ```hcl
+   # In vpc.tf, change count = 2 to count = 1
+   ```
+
+3. **Smaller Nodes**: Use t3.small for demos
+   ```hcl
+   node_instance_type = "t3.small"  # $0.021/hr instead of $0.042
+   ```
+
+4. **Spot Instances**: Add spot configuration for up to 90% savings
+   ```hcl
+   # Add to eks.tf node group
+   capacity_type = "SPOT"
+   ```
+
+---
+
+##  Step 5: Cleanup
+
+### Destroy Single Preview
+
+```bash
+./scripts/destroy-preview.sh 1
+```
+
+### Destroy All Infrastructure
+
+```bash
 cd infrastructure/terraform
-terraform apply -var-file=terraform.tfvars
+terraform destroy
 ```
 
-### Viewing Logs
+This removes:
+- EKS cluster
+- VPC and subnets
+- NAT gateways
+- Load balancers
+- ECR repository
+- IAM roles
 
+---
+
+##  Troubleshooting
+
+### GitHub Actions Can't Authenticate
+
+Check the OIDC trust policy:
 ```bash
-# All preview namespaces
-kubectl get ns -l pr-preview=true
+aws iam get-role --role-name pr-previews-github-actions-role
+```
 
-# Logs for a specific PR
-kubectl logs -n pr-123 -l app=preview-app -f
+Verify the repo name matches exactly (case-sensitive).
+
+### Pods Stuck in Pending
+
+Check node resources:
+```bash
+kubectl describe nodes
+kubectl get events -A
+```
+
+Scale up nodes if needed:
+```bash
+aws eks update-nodegroup-config \
+    --cluster-name pr-previews-eks \
+    --nodegroup-name pr-previews-nodes \
+    --scaling-config desiredSize=3
+```
+
+### Load Balancer Not Created
+
+Check ingress controller logs:
+```bash
+kubectl logs -n ingress-nginx -l app.kubernetes.io/component=controller
+```
+
+Verify AWS Load Balancer Controller (if using):
+```bash
+kubectl get pods -n kube-system | grep aws-load-balancer
+```
+
+### ECR Push Failures
+
+Verify ECR permissions:
+```bash
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin YOUR_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com
 ```
 
 ---
 
-## Troubleshooting
+##  Monitoring
 
-### GitHub Actions can't connect to EKS
-
-1. Check IAM role trust policy includes your repo
-2. Verify OIDC provider is set up correctly
-3. Check KUBECONFIG_BASE64 is valid
-
-### Pods not starting
+### Basic Monitoring
 
 ```bash
-# Check events
-kubectl describe pod -n pr-123 preview-app-xxx
+# Watch all preview namespaces
+watch kubectl get pods -l pr-preview=true --all-namespaces
 
-# Common issues:
-# - Image pull errors: Check GHCR authentication
-# - Resource limits: Increase node size
+# Resource usage
+kubectl top pods --all-namespaces
+kubectl top nodes
 ```
 
-### Load Balancer not getting external IP
+### CloudWatch Integration
 
-```bash
-# Check ingress controller
-kubectl get svc -n ingress-nginx
-
-# Check AWS Load Balancer
-aws elbv2 describe-load-balancers
-```
+EKS automatically sends logs to CloudWatch. View in AWS Console:
+- CloudWatch  Logs  /aws/eks/pr-previews-eks
 
 ---
 
-## Security Considerations
+##  Security Considerations
 
-1. **Private Subnets**: Worker nodes run in private subnets
-2. **OIDC Authentication**: No long-lived AWS credentials in GitHub
-3. **Namespace Isolation**: Each PR gets its own namespace
-4. **Resource Limits**: Containers have CPU/memory limits
-5. **Network Policies**: Consider adding for production use
+### Current Security Features
+
+1. **OIDC Authentication**: No long-lived AWS credentials in GitHub
+2. **Private Subnets**: Worker nodes not directly exposed
+3. **NAT Gateways**: Outbound-only internet access for nodes
+4. **ECR Scanning**: Images scanned on push
+5. **Least Privilege**: IAM roles with minimal permissions
+
+### Additional Recommendations
+
+1. **Enable EKS Secrets Encryption**
+2. **Add Network Policies** for pod-to-pod traffic control
+3. **Enable Pod Security Standards**
+4. **Add WAF** in front of the Load Balancer
+5. **Enable VPC Flow Logs** for network monitoring
+
+---
+
+##  Next Steps
+
+1. **Add your own app** - Replace the sample with your real application
+2. **Add tests** - Integrate testing before preview deployment
+3. **Add monitoring** - Set up Prometheus/Grafana or CloudWatch dashboards
+4. **Add custom domains** - Use Route53 for pretty URLs
+
+ **[Back to README ](../README.md)**
